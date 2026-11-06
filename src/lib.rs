@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
-pub mod op;
-pub mod wal;
-pub mod kv;
-pub mod pubsub;
 pub mod core;
-pub mod snapshot;
+pub mod kv;
 #[path = "loop.rs"]
 pub mod loop_;
+pub mod op;
+pub mod pubsub;
+pub mod snapshot;
+pub mod wal;
