@@ -1,0 +1,21 @@
+[package]
+name = "realtime-backend-fuzz"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[[bin]]
+name = "parse_tcp"
+path = "fuzz_targets/parse_tcp.rs"
+
+[[bin]]
+name = "parse_ws_http"
+path = "fuzz_targets/parse_ws_http.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+realtime-backend = { path = ".." }
+
+[workspace]
