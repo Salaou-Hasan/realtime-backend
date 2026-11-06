@@ -3,7 +3,9 @@ use crate::op::Op;
 use crc::Crc;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::time::Instant;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 pub const CRC: Crc<u32> = Crc::<u32>::new(&crc::CRC_32_ISCSI);
 /// Record header: crc32 (4 bytes) + lsn (8 bytes) + ts (8 bytes).
@@ -237,9 +239,40 @@ pub fn decode_all(buf: &[u8]) -> Result<Vec<WalRecord>, Error> {
 /// (64KB or 0.5ms). `sync=true` ops force an immediate [`flush`](WalFile::flush)
 /// before ack. WAL errors map to [`Error::WalFull`] so callers reject
 /// Put/Pub but keep serving Get/Sub from memory (spec Error Handling).
-
 /// Group-commit buffer threshold: flush when the buffer exceeds 64KB.
 pub const GROUP_COMMIT_BYTES: usize = 64 * 1024;
+
+/// Alias for [`GROUP_COMMIT_BYTES`] (64KB buffer, spec §WAL).
+pub const WAL_BUF_CAP: usize = GROUP_COMMIT_BYTES;
+
+/// Group-commit interval (spec §WAL): flush every 0.5ms or 64KB.
+pub const WAL_FLUSH_INTERVAL: Duration = Duration::from_micros(500);
+
+/// Decode the valid prefix of `raw`, stopping at the first
+/// torn/corrupt frame (crash mid-write). Records are returned in
+/// LSN order. Unlike [`decode_all`] (strict), this never errors on
+/// a torn tail so boot-time replay can ignore a partial final
+/// record.
+fn decode_prefix(raw: &[u8]) -> Vec<WalRecord> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while raw.len() - offset >= HEADER {
+        let Ok((_, consumed)) = decode_op(&raw[offset + HEADER..]) else {
+            break;
+        };
+        let total = HEADER + consumed;
+        if total > MAX_RECORD_SIZE || raw.len() - offset < total {
+            break;
+        }
+        let Ok(rec) = decode_record(&raw[offset..offset + total]) else {
+            break;
+        };
+        out.push(rec);
+        offset += total;
+    }
+    out.sort_by_key(|r| r.lsn);
+    out
+}
 
 #[derive(Debug)]
 pub struct WalFile {
@@ -251,6 +284,7 @@ pub struct WalFile {
     last_flush: Instant,
     flush_count: u64,
     fail_next: bool,
+    cleanup_on_drop: bool,
 }
 
 impl Default for WalFile {
@@ -271,6 +305,7 @@ impl WalFile {
             last_flush: Instant::now(),
             flush_count: 0,
             fail_next: false,
+            cleanup_on_drop: false,
         }
     }
 
@@ -280,9 +315,27 @@ impl WalFile {
         Self::open_in_memory()
     }
 
-    /// Alias for [`open_in_memory`](WalFile::open_in_memory) (plan Task 3 name).
+    /// Temp-file WAL for tests. The file is created under the system
+    /// temp dir with a unique name and removed on drop. Unlike
+    /// [`open_in_memory`](WalFile::open_in_memory) this exercises the
+    /// real `sync_data` path and [`replay`](WalFile::replay) file I/O.
     pub fn temp() -> Self {
-        Self::open_in_memory()
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "realtime-wal-{}-{}-{}.log",
+            std::process::id(),
+            seq,
+            nanos
+        ));
+        let mut wal =
+            Self::open(path.to_string_lossy().into_owned()).expect("failed to create temp WAL");
+        wal.cleanup_on_drop = true;
+        wal
     }
 
     /// Open (or create) a file-backed WAL at `path`.
@@ -302,7 +355,23 @@ impl WalFile {
             last_flush: Instant::now(),
             flush_count: 0,
             fail_next: false,
+            cleanup_on_drop: false,
         })
+    }
+
+    /// Path of the underlying WAL file, or an empty path for the
+    /// pure in-memory WAL. Useful for tests (`WalFile::temp`) and
+    /// diagnostics.
+    pub fn name(&self) -> &Path {
+        self.path
+            .as_deref()
+            .map(Path::new)
+            .unwrap_or_else(|| Path::new(""))
+    }
+
+    /// Alias for [`name`](WalFile::name).
+    pub fn path(&self) -> &Path {
+        self.name()
     }
 
     /// Test hook: next `append`/`flush` returns `WalFull` (disk-full mock).
@@ -336,13 +405,25 @@ impl WalFile {
     /// when the encoded record exceeds the payload cap. Does not
     /// write-through itself; `sync=true` callers must call
     /// [`flush`](WalFile::flush) explicitly.
+    ///
+    /// Group commit (spec §WAL): flushes pending data first if the
+    /// buffer has been waiting >=0.5ms, and flushes before this
+    /// record would overflow the 64KB buffer. WAL I/O errors surface
+    /// as [`Error::WalFull`] (spec §Error Handling) so `Core` can
+    /// reject Put/Pub while keeping Get/Sub servable.
     pub fn append(&mut self, r: &WalRecord) -> Result<(), Error> {
         if self.fail_next {
             self.fail_next = false;
             return Err(Error::WalFull);
         }
+        // Time half of group commit: flush if pending bytes have
+        // been waiting >=0.5ms since the last fdatasync.
+        if !self.buf.is_empty() && self.last_flush.elapsed() >= WAL_FLUSH_INTERVAL {
+            self.flush()?;
+        }
         let bytes = encode_record(r)?;
-        // Group commit: flush if this record would overflow the 64KB buffer.
+        // Size half of group commit: flush if this record would
+        // overflow the 64KB buffer.
         if self.buf.len() + bytes.len() > GROUP_COMMIT_BYTES && !self.buf.is_empty() {
             self.flush()?;
         }
@@ -372,9 +453,13 @@ impl WalFile {
         Ok(())
     }
 
-    /// Replay all records (persisted file content + in-memory buffer) in
-    /// LSN order. Used on boot to rebuild KV + topics.
+    /// Replay all records in LSN order. Used on boot to rebuild
+    /// KV + topics. Flushes pending buffered bytes first, then
+    /// reads the full file (file-backed) or the persisted bytes
+    /// (in-memory). A torn tail from a crash mid-write terminates
+    /// the scan; the valid prefix is returned.
     pub fn replay(&mut self) -> Result<Vec<WalRecord>, Error> {
+        self.flush()?;
         let raw = if let Some(path) = self.path.clone() {
             let mut raw = Vec::new();
             File::open(&path)
@@ -390,12 +475,25 @@ impl WalFile {
         if raw.is_empty() {
             return Ok(Vec::new());
         }
-        decode_all(&raw)
+        Ok(decode_prefix(&raw))
     }
 
     /// All bytes still buffered (pending group-commit flush).
     pub fn buffered_bytes(&self) -> &[u8] {
         &self.buf
+    }
+}
+
+impl Drop for WalFile {
+    fn drop(&mut self) {
+        // `WalFile::temp` shares the file with `open` but owns its
+        // temp filename; remove it best-effort. A never-created file
+        // (in-memory WAL) has no path to remove.
+        if self.cleanup_on_drop {
+            if let Some(path) = &self.path {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 }
 
@@ -542,5 +640,82 @@ mod tests {
         assert_eq!(back[1].lsn, 2);
         assert_eq!(back[2].lsn, 3);
         assert_eq!(back[1].ts, 11);
+    }
+
+    #[test]
+    fn replay_restores_put() {
+        let mut wal = WalFile::temp();
+        wal.append(&WalRecord {
+            lsn: 1,
+            ts: 1,
+            op: Op::Put {
+                key: "k".into(),
+                value: vec![9u8],
+                sync: false,
+            },
+        })
+        .unwrap();
+        // Small append stays in the group-commit buffer until flushed.
+        assert!(!wal.is_flushed());
+        wal.flush().unwrap();
+        assert!(wal.is_flushed());
+        let replayed: Vec<WalRecord> = wal.replay().unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].lsn, 1);
+        assert_eq!(replayed[0].ts, 1);
+        match &replayed[0].op {
+            Op::Put { key, value, sync } => {
+                assert_eq!(key, "k");
+                assert_eq!(value, &vec![9u8]);
+                assert!(!*sync);
+            }
+            other => panic!("expected Put, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flush_size_threshold() {
+        let mut wal = WalFile::temp();
+        // Each record: HEADER(20) + 1(tag) + 1(sync) + 4 + 1(k) + 4 + 8192
+        // = 8223 bytes. 20 records ~= 164KB >> 64KB buffer cap.
+        // Group commit must auto-flush without any explicit flush().
+        // A single record must stay buffered (not flushed yet).
+        wal.append(&WalRecord {
+            lsn: 1,
+            ts: 0,
+            op: Op::Put {
+                key: "k".into(),
+                value: vec![0u8; 8192],
+                sync: false,
+            },
+        })
+        .unwrap();
+        assert!(!wal.is_flushed());
+        assert!(wal.buffered_len() < WAL_BUF_CAP);
+
+        for i in 1..20u64 {
+            wal.append(&WalRecord {
+                lsn: i + 1,
+                ts: i,
+                op: Op::Put {
+                    key: "k".into(),
+                    value: vec![i as u8; 8192],
+                    sync: false,
+                },
+            })
+            .unwrap();
+        }
+
+        // No explicit flush() was called: size/time group-commit
+        // must have written at least one full 64KB chunk to disk,
+        // and the buffer can never hold more than one chunk.
+        let on_disk = std::fs::metadata(wal.name()).unwrap().len();
+        assert!(on_disk >= WAL_BUF_CAP as u64, "on_disk={on_disk}");
+        assert!(
+            wal.buffered_len() < WAL_BUF_CAP,
+            "buffered={}",
+            wal.buffered_len()
+        );
+        assert_eq!(wal.replay().unwrap().len(), 20);
     }
 }
