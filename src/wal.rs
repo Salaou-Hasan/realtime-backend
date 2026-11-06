@@ -1,6 +1,9 @@
 use crate::op::Error;
 use crate::op::Op;
 use crc::Crc;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::time::Instant;
 
 pub const CRC: Crc<u32> = Crc::<u32>::new(&crc::CRC_32_ISCSI);
 /// Record header: crc32 (4 bytes) + lsn (8 bytes) + ts (8 bytes).
@@ -226,6 +229,174 @@ pub fn decode_all(buf: &[u8]) -> Result<Vec<WalRecord>, Error> {
         offset += total;
     }
     Ok(out)
+}
+
+/// Group-commit WAL writer (Task 3/6).
+///
+/// Buffers encoded records and flushes via `fdatasync` on group commit
+/// (64KB or 0.5ms). `sync=true` ops force an immediate [`flush`](WalFile::flush)
+/// before ack. WAL errors map to [`Error::WalFull`] so callers reject
+/// Put/Pub but keep serving Get/Sub from memory (spec Error Handling).
+
+/// Group-commit buffer threshold: flush when the buffer exceeds 64KB.
+pub const GROUP_COMMIT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+pub struct WalFile {
+    file: Option<File>,
+    path: Option<String>,
+    buf: Vec<u8>,
+    persisted: Vec<u8>,
+    lsn: u64,
+    last_flush: Instant,
+    flush_count: u64,
+    fail_next: bool,
+}
+
+impl Default for WalFile {
+    fn default() -> Self {
+        Self::open_in_memory()
+    }
+}
+
+impl WalFile {
+    /// In-memory WAL (no file). Used by `Core::new_in_memory` and tests.
+    pub fn open_in_memory() -> Self {
+        Self {
+            file: None,
+            path: None,
+            buf: Vec::with_capacity(GROUP_COMMIT_BYTES),
+            persisted: Vec::new(),
+            lsn: 0,
+            last_flush: Instant::now(),
+            flush_count: 0,
+            fail_next: false,
+        }
+    }
+
+    /// Alias for [`open_in_memory`](WalFile::open_in_memory).
+    #[allow(clippy::new_without_default)]
+    pub fn new_in_memory() -> Self {
+        Self::open_in_memory()
+    }
+
+    /// Alias for [`open_in_memory`](WalFile::open_in_memory) (plan Task 3 name).
+    pub fn temp() -> Self {
+        Self::open_in_memory()
+    }
+
+    /// Open (or create) a file-backed WAL at `path`.
+    pub fn open(path: impl Into<String>) -> Result<Self, Error> {
+        let path = path.into();
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|_| Error::WalFull)?;
+        Ok(Self {
+            file: Some(file),
+            path: Some(path),
+            buf: Vec::with_capacity(GROUP_COMMIT_BYTES),
+            persisted: Vec::new(),
+            lsn: 0,
+            last_flush: Instant::now(),
+            flush_count: 0,
+            fail_next: false,
+        })
+    }
+
+    /// Test hook: next `append`/`flush` returns `WalFull` (disk-full mock).
+    pub fn set_fail_next(&mut self, v: bool) {
+        self.fail_next = v;
+    }
+
+    pub fn fail_next(&self) -> bool {
+        self.fail_next
+    }
+
+    pub fn lsn(&self) -> u64 {
+        self.lsn
+    }
+
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn flush_count(&self) -> u64 {
+        self.flush_count
+    }
+
+    /// True when there is nothing buffered (all appended bytes flushed).
+    pub fn is_flushed(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// Append a record to the group-commit buffer. Returns
+    /// [`Error::WalFull`] on (mocked) I/O failure and [`Error::OpTooLarge`]
+    /// when the encoded record exceeds the payload cap. Does not
+    /// write-through itself; `sync=true` callers must call
+    /// [`flush`](WalFile::flush) explicitly.
+    pub fn append(&mut self, r: &WalRecord) -> Result<(), Error> {
+        if self.fail_next {
+            self.fail_next = false;
+            return Err(Error::WalFull);
+        }
+        let bytes = encode_record(r)?;
+        // Group commit: flush if this record would overflow the 64KB buffer.
+        if self.buf.len() + bytes.len() > GROUP_COMMIT_BYTES && !self.buf.is_empty() {
+            self.flush()?;
+        }
+        self.buf.extend_from_slice(&bytes);
+        self.lsn = r.lsn;
+        Ok(())
+    }
+
+    /// Write buffered bytes and `fdatasync` (group commit). No-op when
+    /// the buffer is empty. In-memory WALs move bytes to `persisted`.
+    pub fn flush(&mut self) -> Result<(), Error> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        if self.fail_next {
+            self.fail_next = false;
+            return Err(Error::WalFull);
+        }
+        if let Some(file) = self.file.as_mut() {
+            file.write_all(&self.buf).map_err(|_| Error::WalFull)?;
+            file.sync_data().map_err(|_| Error::WalFull)?;
+        }
+        self.persisted.extend_from_slice(&self.buf);
+        self.buf.clear();
+        self.last_flush = Instant::now();
+        self.flush_count += 1;
+        Ok(())
+    }
+
+    /// Replay all records (persisted file content + in-memory buffer) in
+    /// LSN order. Used on boot to rebuild KV + topics.
+    pub fn replay(&mut self) -> Result<Vec<WalRecord>, Error> {
+        let raw = if let Some(path) = self.path.clone() {
+            let mut raw = Vec::new();
+            File::open(&path)
+                .map_err(|_| Error::WalFull)?
+                .read_to_end(&mut raw)
+                .map_err(|_| Error::WalFull)?;
+            raw
+        } else {
+            let mut raw = self.persisted.clone();
+            raw.extend_from_slice(&self.buf);
+            raw
+        };
+        if raw.is_empty() {
+            return Ok(Vec::new());
+        }
+        decode_all(&raw)
+    }
+
+    /// All bytes still buffered (pending group-commit flush).
+    pub fn buffered_bytes(&self) -> &[u8] {
+        &self.buf
+    }
 }
 
 #[cfg(test)]
