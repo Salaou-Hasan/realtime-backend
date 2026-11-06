@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod adapters;
 pub mod core;
 pub mod kv;
 #[path = "loop.rs"]
